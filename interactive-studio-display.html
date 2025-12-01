@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Interactive Studio Display</title>
+    <meta name="viewport" content="width=device-width, initial-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        html, body {
+            width: 100%; height: 100%; margin: 0; overflow: hidden;
+            background-color: #111827; /* Dark background */
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #info-overlay {
+            position: absolute; bottom: 0; left: 0; padding: 10px;
+            color: rgba(255, 255, 255, 0.4);
+            font-family: monospace;
+            font-size: 14px;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="displayCanvas"></canvas>
+
+    <div id="info-overlay">
+        <p id="status-message">Connected. Tap your screen to start!</p>
+        <p id="last-command">Last Command: None</p>
+        <p id="sender-id">Last Sender: None</p>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Optional: Enable debug logging for Firebase
+        setLogLevel('Debug');
+
+        // --- FIREBASE SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const COLLECTION_PATH = 'projector_state';
+
+        let db, auth;
+        let unsubscribe = null;
+
+        // --- CANVAS ANIMATION STATE ---
+        const canvas = document.getElementById('displayCanvas');
+        const ctx = canvas.getContext('2d');
+        let width, height;
+
+        // Predefined list of bright colors for the burst effect
+        const BURST_COLORS = ['#FF4D4D', '#4DFF4D', '#4D4DFF', '#FFFF4D', '#FF4DFF', '#4DFFFF'];
+
+        // Array to hold active color burst objects
+        let bursts = [];
+
+        // Configuration for the base B&W grid
+        const bwGridConfig = {
+            gridSize: 30, // Size of the grid cells
+            lineThickness: 1,
+            maxWiggle: 10,
+            bwColor: '#CCCCCC'
+        };
+
+        // --- ANIMATION LOGIC ---
+
+        function resizeCanvas() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+        }
+
+        // Draw the static black and white grid base
+        function drawBwGrid(time) {
+            ctx.fillStyle = "#111827"; // Very dark background
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.strokeStyle = bwGridConfig.bwColor;
+            ctx.lineWidth = bwGridConfig.lineThickness;
+
+            const gridSize = bwGridConfig.gridSize;
+            const numX = Math.ceil(width / gridSize);
+            const numY = Math.ceil(height / gridSize);
+            const wiggleSpeed = 0.001; // Slower movement
+
+            // Draw vertical lines
+            for(let i = 0; i <= numX; i++) {
+                // Add a slight sine wave wobble to the lines
+                const xWiggle = Math.sin(time * wiggleSpeed + i) * bwGridConfig.maxWiggle;
+                const x = i * gridSize + xWiggle;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+
+            // Draw horizontal lines
+            for(let j = 0; j <= numY; j++) {
+                // Add a slight cosine wave wobble
+                const yWiggle = Math.cos(time * wiggleSpeed + j) * bwGridConfig.maxWiggle;
+                const y = j * gridSize + yWiggle;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+        }
+
+        // Draw the color burst ripples
+        function drawBursts(time) {
+            // Filter out bursts that have completed their lifespan
+            bursts = bursts.filter(burst => {
+                const elapsed = time - burst.startTime;
+                const duration = 2000; // 2 seconds lifespan
+
+                if (elapsed > duration) return false;
+
+                const progress = elapsed / duration;
+                const opacity = 1.0 - progress; // Fade out
+                const maxRadius = Math.min(width, height) * 0.7;
+                const radius = progress * maxRadius; // Grow linearly
+
+                // Calculate screen coordinates based on relative phone coordinates
+                const x = burst.x * width;
+                const y = burst.y * height;
+
+                ctx.save();
+                ctx.globalAlpha = opacity * 0.8; // Max 80% opacity
+
+                // Draw multiple concentric circles for the ripple effect
+                for(let i = 0; i < 3; i++) {
+                    const rippleRadius = radius * (1 - i * 0.1); // Inner rings are slightly smaller
+
+                    ctx.beginPath();
+                    ctx.arc(x, y, rippleRadius, 0, Math.PI * 2);
+
+                    // Create a dynamic light effect using gradients
+                    const gradient = ctx.createRadialGradient(x, y, 0, x, y, rippleRadius);
+                    gradient.addColorStop(0, `${burst.color}FF`); // Full color at center
+                    gradient.addColorStop(0.5, `${burst.color}AA`);
+                    gradient.addColorStop(1, `rgba(0, 0, 0, 0)`); // Transparent edge
+
+                    ctx.fillStyle = gradient;
+                    ctx.fill();
+                }
+
+                ctx.restore();
+                return true; // Keep the burst in the array
+            });
+        }
+
+
+        function animate(time) {
+            // 1. Draw the B&W Base Layer
+            drawBwGrid(time);
+
+            // 2. Draw all active Color Bursts
+            drawBursts(time);
+
+            requestAnimationFrame(animate);
+        }
+
+        // --- FIREBASE LISTENER ---
+
+        function handleProjectorStateChange(docSnapshot) {
+            const data = docSnapshot.data();
+            const lastCommandElement = document.getElementById('last-command');
+            const senderIdElement = document.getElementById('sender-id');
+
+            if (data && data.command === 'burst') {
+                // A new burst command has arrived!
+                const newBurst = {
+                    x: data.x,
+                    y: data.y,
+                    color: data.color,
+                    startTime: performance.now(),
+                    sender: data.sender
+                };
+                bursts.push(newBurst); // Add to the array for rendering
+
+                // Update UI overlay
+                const senderSubstring = data.sender ? data.sender.substring(0, 8) : 'N/A';
+                lastCommandElement.textContent = `Last Command: Burst at (${data.x.toFixed(2)}, ${data.y.toFixed(2)})`;
+                senderIdElement.textContent = `Last Sender: ${senderSubstring}`;
+
+            } else if (!data) {
+                 lastCommandElement.textContent = "Last Command: None (doc cleared)";
+            }
+        }
+
+        async function initFirebaseAndListen() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // 1. Authenticate the user (Display runs anonymously as a listener)
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 2. Set up the real-time listener for the master control document
+                // Note: We use the same 'master_control' document to transmit transient data
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_PATH, 'master_control');
+
+                unsubscribe = onSnapshot(docRef, (docSnapshot) => {
+                    handleProjectorStateChange(docSnapshot);
+                }, (error) => {
+                    console.error("Firestore Listener Error:", error);
+                    document.getElementById('status-message').textContent = `DB Error: ${error.message}`;
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Failed:", error);
+                document.getElementById('status-message').textContent = `Initialization Error: ${error.message}`;
+            }
+        }
+
+        // --- INITIALIZATION ---
+        window.addEventListener('resize', resizeCanvas);
+
+        window.onload = function() {
+            resizeCanvas();
+            initFirebaseAndListen();
+            animate(0); // Start the animation loop
+        };
+
+        window.onbeforeunload = function() {
+            if (unsubscribe) {
+                unsubscribe();
+            }
+        };
+
+    </script>
+</body>
+</html>
