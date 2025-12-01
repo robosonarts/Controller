@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Tap to Ignite Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Base B&W Vibe */
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: #000000; /* Pure Black */
+            color: #FFFFFF; /* Pure White */
+            touch-action: manipulation;
+            user-select: none;
+            cursor: pointer;
+            overflow: hidden;
+        }
+        #touch-area {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+            text-align: center;
+            /* Optional: Add a subtle texture or noise effect here for a B&W art vibe */
+        }
+        
+        /* Tap feedback element */
+        #tap-indicator {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0); /* Start transparent */
+            pointer-events: none;
+            z-index: 1000;
+            transition: background-color 0.1s ease-out; /* Quick flash */
+        }
+        
+        .prompt-text {
+            /* Subtle animation to draw attention */
+            animation: pulse-prompt 4s infinite ease-in-out;
+            color: #999999;
+        }
+        
+        @keyframes pulse-prompt {
+            0% { opacity: 0.6; }
+            50% { opacity: 1.0; }
+            100% { opacity: 0.6; }
+        }
+        
+        .user-info {
+            color: #444444; /* Dark gray for footer info */
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading-screen" class="fixed inset-0 bg-[#000000] flex flex-col justify-center items-center z-50">
+        <div class="animate-spin rounded-full h-12 w-12 border-4 border-b-transparent border-white"></div>
+        <p class="mt-4 text-gray-400">Loading connection...</p>
+    </div>
+    
+    <!-- Visual Indicator for the tap -->
+    <div id="tap-indicator"></div>
+
+    <div id="touch-area" class="hidden">
+        <h1 class="text-3xl font-light mb-4 tracking-widest">INTERACT</h1>
+        <p class="prompt-text text-lg max-w-xs">TOUCH THE SCREEN TO IGNITE THE CANVAS</p>
+        <p class="absolute bottom-4 left-4 text-xs user-info">ID: <span id="user-id-display" class="font-mono"></span></p>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        setLogLevel('Debug');
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId;
+        const COLLECTION_PATH = 'projector_state';
+        // Keep the colors for the projector display, even though the controller is B&W
+        const BURST_COLORS_HEX = ['#FF4D4D', '#4DFF4D', '#4D4DFF', '#FFFF4D', '#FF4DFF', '#4DFFFF'];
+
+
+        function getRandomColor() {
+            return BURST_COLORS_HEX[Math.floor(Math.random() * BURST_COLORS_HEX.length)];
+        }
+
+        // Updated feedback function for a subtle, black-and-white flash
+        function showTapFeedback() {
+            const indicator = document.getElementById('tap-indicator');
+            // Flash white quickly
+            indicator.style.backgroundColor = 'rgba(255, 255, 255, 0.4)'; 
+            
+            // Clear the flash after 100ms
+            setTimeout(() => {
+                indicator.style.backgroundColor = 'rgba(255, 255, 255, 0)';
+            }, 100);
+        }
+
+        async function sendBurstCommand(event) {
+            // Prevent scrolling on touch devices
+            if (event.type === 'touchstart') {
+                event.preventDefault();
+            }
+
+            if (!db || !userId) {
+                console.error("Database not ready or User not signed in.");
+                return;
+            }
+
+            // Determine tap coordinates (normalize to 0-1)
+            let clientX, clientY;
+            
+            if (event.touches && event.touches.length > 0) {
+                clientX = event.touches[0].clientX;
+                clientY = event.touches[0].clientY;
+            } else if (event.clientX !== undefined) {
+                clientX = event.clientX;
+                clientY = event.clientY;
+            } else {
+                return;
+            }
+            
+            // Normalize coordinates (0 to 1)
+            const normalizedX = clientX / window.innerWidth;
+            const normalizedY = clientY / window.innerHeight;
+            
+            const color = getRandomColor();
+
+            showTapFeedback(); // Show the visual flash feedback
+
+            try {
+                // The projector app listens to this single document for real-time changes
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_PATH, 'master_control');
+
+                // Update the document with the burst command (this overwrites previous command)
+                await setDoc(docRef, {
+                    command: 'burst',
+                    x: normalizedX,
+                    y: normalizedY,
+                    color: color,
+                    timestamp: serverTimestamp(),
+                    sender: userId,
+                });
+
+            } catch (error) {
+                console.error("Error sending burst command:", error);
+            }
+        }
+
+        async function initFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. Authenticate the user
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                // 2. Get the authenticated user ID (or a random one if anonymous sign-in failed)
+                userId = auth.currentUser?.uid || crypto.randomUUID();
+                document.getElementById('user-id-display').textContent = userId;
+
+                // 3. Attach listeners and show the app
+                const touchArea = document.getElementById('touch-area');
+                // Use 'click' for desktop and 'touchstart' for mobile, and prevent touch events from causing scroll/zoom
+                document.body.addEventListener('click', sendBurstCommand);
+                document.body.addEventListener('touchstart', sendBurstCommand, { passive: false });
+
+
+                document.getElementById('loading-screen').classList.add('hidden');
+                touchArea.classList.remove('hidden');
+
+            } catch (error) {
+                console.error("Firebase Initialization Failed:", error);
+                document.getElementById('loading-screen').innerHTML = `<p class="text-red-400">Initialization Error: ${error.message}</p>`;
+            }
+        }
+
+        // Initialize everything on load
+        initFirebase();
+    </script>
+</body>
+</html>
